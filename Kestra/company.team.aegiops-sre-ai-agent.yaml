@@ -1,0 +1,248 @@
+id: aegiops-sre-ai-agent
+namespace: company.team
+description: "AegiOps: Multi-modal SRE Agent handling Incident Response, Cost, Deployment, and Troubleshooting."
+
+inputs:
+  - name: user_query
+    type: STRING
+    description: "Ask the agent a question (e.g., 'Deploy Redis', 'Find unused namespaces') or leave empty for Auto-Scan."
+    defaults: "Auto-scan cluster for issues and fix them."
+
+# -------------------------------------------------------------------------
+# THE DAEMON (Observer)
+# Polls the cluster for complete state
+# -------------------------------------------------------------------------
+tasks:
+  - id: observer_daemon
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: get_pods
+        type: io.kestra.plugin.kubernetes.kubectl.Get
+        resourceType: pods
+        outputFiles:
+          - pods.json
+      - id: get_events
+        type: io.kestra.plugin.kubernetes.kubectl.Get
+        resourceType: events
+        outputFiles:
+          - events.json
+      - id: get_deployments
+        type: io.kestra.plugin.kubernetes.kubectl.Get
+        resourceType: deployments
+        apiGroup: apps
+        apiVersion: v1
+        outputFiles:
+          - deployments.json
+      - id: get_namespaces
+        type: io.kestra.plugin.kubernetes.kubectl.Get
+        resourceType: namespaces
+        namespace: ""
+        outputFiles:
+          - namespaces.json
+
+  # -------------------------------------------------------------------------
+  # THE AGENT (The Brain)
+  # Classifies User Intent -> Determines Action
+  # -------------------------------------------------------------------------
+  - id: ai_agent_core
+    type: io.kestra.plugin.ai.completion.ChatCompletion
+    provider:
+      type: io.kestra.plugin.ai.provider.GoogleGemini
+      apiKey: "your_apiKey"
+      modelName: gemini-2.5-flash
+    messages:
+      - type: SYSTEM
+        content: |
+          You are AegiOps, an Autonomous SRE Agent.
+          
+          DATA CONTEXT:
+          - Pods, Events, Deployments, and Namespaces are provided below.
+          
+          YOUR GOAL:
+          Analyze the "{{ inputs.user_query }}" and the Cluster Data to determine the correct intent.
+          
+          SCENARIOS & OUTPUT FORMAT:
+          
+          1. INCIDENT RESPONSE / AUTO-SCAN (e.g., "Why is X failing?", "Auto-scan")
+             - Analyze logs/status. If an issue is found, classify as:
+             - "TRANSIENT" (Fix: Delete Pod)
+             - "CONFIG" (Fix: Patch Deployment). **CRITICAL:** If CONFIG, you MUST provide a "patch_body" JSON object.
+                - If specific fix is known (e.g., "Change image to v2"), put that in "patch_body".
+                - If generic fix needed, put a label patch in "patch_body": {"spec": {"template": {"metadata": {"labels": {"remediation": "aegiops-restart"}}}}}
+             - "FATAL" (Fix: Alert Human)
+             - "HEALTHY" (No issues)
+             - Output JSON: { "intent": "REMEDIATE", "status": "CONFIG", "resource": "deployment-name", "namespace": "default", "reason": "ImagePullBackOff detected", "patch_body": { ... } }
+          
+          2. COST OPTIMIZATION (e.g., "Find unused namespaces")
+             - Compare list of Namespaces vs running Pods. Find empty ones.
+             - Output JSON: { "intent": "COST", "explanation": "Found 2 unused namespaces: test-1, dev-2. Recommend deletion." }
+          
+          3. DEPLOYMENT (e.g., "Deploy Redis with 3 replicas")
+             - Generate valid Kubernetes YAML for the request.
+             - Output JSON: { "intent": "DEPLOY", "yaml": "apiVersion: apps/v1\nkind: Deployment...", "explanation": "Deploying Redis..." }
+          
+          4. TROUBLESHOOTING (e.g., "Explain events for pod X")
+             - Correlate events for that pod and summarize.
+             - Output JSON: { "intent": "EXPLAIN", "explanation": "At 10:00 pod was scheduled, then failed pulling image..." }
+
+          IMPORTANT: Output ONLY valid JSON.
+      - type: USER
+        content: |
+          USER QUERY: "{{ inputs.user_query }}"
+          
+          CLUSTER STATE:
+          Pods: {{ read(outputs.get_pods.uri) }}
+          Events: {{ read(outputs.get_events.uri) }}
+          Deployments: {{ read(outputs.get_deployments.uri) }}
+          Namespaces: {{ read(outputs.get_namespaces.uri) }}
+
+  # -------------------------------------------------------------------------
+  # THE DECISION ENGINE (Robust Version)
+  # -------------------------------------------------------------------------
+  - id: decision_parser
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: "io.kestra.plugin.core.runner.Process"
+    script: |
+      import json
+      
+      # 1. Get Raw Output
+      raw = """{{ outputs.ai_agent_core.aiResponse }}"""
+      clean = raw.replace("```json", "").replace("```", "").strip()
+      
+      try:
+          # ✅ FIX: strict=False allows unescaped newlines in the YAML string
+          data = json.loads(clean, strict=False)
+          
+          # 2. SAFETY CHECK: Ensure 'intent' key exists
+          if "intent" not in data:
+              if "status" in data:
+                  data["intent"] = "REMEDIATE"
+              elif "yaml" in data:
+                  data["intent"] = "DEPLOY"
+              else:
+                  data["intent"] = "EXPLAIN"
+                  if "explanation" not in data:
+                      data["explanation"] = "AI returned incomplete data."
+
+          # 3. SAFETY CHECK: Ensure patch_body exists for CONFIG
+          if data.get("intent") == "REMEDIATE" and data.get("status") == "CONFIG":
+              if "patch_body" not in data:
+                  data["status"] = "FATAL"
+                  data["reason"] = "AI identified CONFIG error but failed to generate a Patch."
+
+          print('::{"outputs": ' + json.dumps(data) + '}::')
+          
+      except Exception as e:
+          # 5. CATASTROPHIC FALLBACK
+          fallback = {
+              "intent": "EXPLAIN", 
+              "explanation": f"JSON Parse Error: {str(e)}. Raw AI Output: {clean[:100]}..."
+          }
+          print('::{"outputs": ' + json.dumps(fallback) + '}::')
+  # -------------------------------------------------------------------------
+  # THE ACTUATOR (Execute Fix / Reply)
+  # -------------------------------------------------------------------------
+  - id: intent_switch
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ outputs.decision_parser.vars.intent }}"
+    cases:
+      
+      # === CASE 1: REMEDIATION ===
+      REMEDIATE:
+        - id: remediate_inner_switch
+          type: io.kestra.plugin.core.flow.Switch
+          value: "{{ outputs.decision_parser.vars.status }}"
+          cases:
+            TRANSIENT:
+              - id: action_delete_pod
+                type: io.kestra.plugin.kubernetes.kubectl.Delete
+                resourcesNames: ["{{ outputs.decision_parser.vars.resource }}"]
+                namespace: "{{ outputs.decision_parser.vars.namespace }}"
+                resourceType: "pods"
+              - id: notify_transient
+                type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+                url: "#slack-webhook-url"
+                payload: |
+                  {{ { "text": "✅ *Auto-Fix:* Deleted pod `" ~ outputs.decision_parser.vars.resource ~ "` (" ~ outputs.decision_parser.vars.reason ~ ")" } }}
+            
+            # --- MODIFIED CONFIG SECTION (SMART PATCH) ---
+            CONFIG:
+              - id: action_patch_deploy
+                type: io.kestra.plugin.kubernetes.kubectl.Patch
+                resourceName: "{{ outputs.decision_parser.vars.resource }}"
+                namespace: "{{ outputs.decision_parser.vars.namespace }}"
+                resourceType: "deployment"
+                apiGroup: "apps"
+                apiVersion: "v1"
+                patch: "{{ outputs.decision_parser.vars.patch_body }}"
+
+              - id: notify_config
+                type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+                url: "#slack-webhook-url"
+                payload: |
+                  {{ { "text": "🛠️ *AegiOps Smart Patch:* Applied AI-suggested config fix to `" ~ outputs.decision_parser.vars.resource ~ "`.\n*Reason:* " ~ outputs.decision_parser.vars.reason } }}
+            # ---------------------------------------------
+
+            FATAL:
+              - id: notify_fatal
+                type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+                url: "#slack-webhook-url"
+                payload: |
+                  {{ { "text": "🚨 *Escalation:* " ~ outputs.decision_parser.vars.reason } }}
+            
+            HEALTHY:
+              - id: log_healthy
+                type: io.kestra.plugin.core.log.Log
+                message: "Cluster is healthy."
+              - id: notify_slack_healthy
+                type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+                url: "#slack-webhook-url"
+                payload: |
+                  {{
+                    {
+                      "text": "🟢 *AegiOps Scan Complete*\n*Cluster Status:* Healthy\n*No issues found in namespace:* " ~ outputs.decision_parser.vars.target_namespace
+                    }
+                  }}
+
+      # === CASE 2: DEPLOYMENT (Generates & Applies YAML) ===
+      DEPLOY:
+        - id: write_manifest
+          type: io.kestra.plugin.core.storage.LocalFiles
+          inputs:
+            generated.yaml: "{{ outputs.decision_parser.vars.yaml }}"
+            
+        - id: apply_manifest
+          type: io.kestra.plugin.kubernetes.kubectl.Apply
+          description: "Natively apply the AI-generated YAML"
+          namespace: "default"
+          spec: "{{ outputs.decision_parser.vars.yaml }}"
+
+        - id: notify_deploy
+          type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+          url: "#slack-webhook-url"
+          payload: |
+            {{ { "text": "🚀 *Deployment Success:* " ~ outputs.decision_parser.vars.explanation } }}
+
+      # === CASE 3: COST OPTIMIZATION (Analysis) ===
+      COST:
+        - id: notify_cost
+          type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+          url: "#slack-webhook-url"
+          payload: |
+            {{ { "text": "💰 *Cost Insight:* " ~ outputs.decision_parser.vars.explanation } }}
+
+      # === CASE 4: EXPLANATION (Troubleshooting) ===
+      EXPLAIN:
+        - id: notify_explain
+          type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+          url: "#slack-webhook-url"
+          payload: |
+            {{ { "text": "🧠 *Analysis:* " ~ outputs.decision_parser.vars.explanation } }}
+
+pluginDefaults:
+  - type: io.kestra.plugin.kubernetes.kubectl.Get
+    forced: false
+    values:
+      fetchType: STORE
+      namespace: default
